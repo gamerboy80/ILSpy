@@ -26,6 +26,7 @@ using System.IO.Compression;
 using System.IO.MemoryMappedFiles;
 using System.Linq;
 using System.Reflection;
+using System.Threading;
 using System.Threading.Tasks;
 
 using ICSharpCode.Decompiler;
@@ -37,8 +38,9 @@ namespace ICSharpCode.ILSpyX
 	/// <summary>
 	/// NuGet package or .NET bundle:
 	/// </summary>
-	public class LoadedPackage
+	public class LoadedPackage : IDisposable
 	{
+		MemoryMappedViewAccessor? ownedBundleView;
 		public enum PackageKind
 		{
 			Zip,
@@ -60,6 +62,23 @@ namespace ICSharpCode.ILSpyX
 		public IReadOnlyList<PackageEntry> Entries { get; }
 
 		public PackageFolder RootFolder { get; }
+
+		internal void OwnBundleView(MemoryMappedViewAccessor view)
+		{
+			ownedBundleView = view;
+		}
+
+		public void Dispose()
+		{
+			Dispose(disposing: true);
+			GC.SuppressFinalize(this);
+		}
+
+		protected virtual void Dispose(bool disposing)
+		{
+			if (disposing)
+				Interlocked.Exchange(ref ownedBundleView, null)?.Dispose();
+		}
 
 		public LoadedPackage(PackageKind kind, IEnumerable<PackageEntry> entries)
 		{
@@ -126,6 +145,7 @@ namespace ICSharpCode.ILSpyX
 				var entries = manifest.Entries.Select(e => new BundleEntry(fileName, view, e)).ToList();
 				var result = new LoadedPackage(PackageKind.Bundle, entries);
 				result.BundleHeader = manifest;
+				result.OwnBundleView(view);
 				view = null; // don't dispose the view, we're still using it in the bundle entries
 				ILSpyXEventSource.Log.PackageOpened(fileName, "bundle", entries.Count);
 				return result;

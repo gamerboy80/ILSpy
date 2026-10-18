@@ -4,6 +4,8 @@
 		"projects": [
 			"ICSharpCode.ILSpyCmd\\ICSharpCode.ILSpyCmd.csproj",
 			"ICSharpCode.ILSpyCmd.Tests\\ICSharpCode.ILSpyCmd.Tests.csproj",
+			"ICSharpCode.ILSpy.Mcp\\ICSharpCode.ILSpy.Mcp.csproj",
+			"ICSharpCode.ILSpy.Mcp.Tests\\ICSharpCode.ILSpy.Mcp.Tests.csproj",
 			"ICSharpCode.Decompiler.PowerShell\\ICSharpCode.Decompiler.PowerShell.csproj",
 			"ICSharpCode.Decompiler.TestRunner\\ICSharpCode.Decompiler.TestRunner.csproj",
 			"ICSharpCode.Decompiler.Tests\\ICSharpCode.Decompiler.Tests.csproj",

@@ -43,6 +43,9 @@ jobs:
     - name: Build Release
       run: dotnet msbuild -mt ILSpy.XPlat.slnf -p:Configuration=Release -bl:Release.binlog
 
+    - name: Test MCP server
+      run: dotnet test --project ICSharpCode.ILSpy.Mcp.Tests/ICSharpCode.ILSpy.Mcp.Tests.csproj --no-restore --report-trx
+
     - name: list files
       if: always()
       run: ls -la
