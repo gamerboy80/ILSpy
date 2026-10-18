@@ -39,7 +39,7 @@ namespace ICSharpCode.ILSpy.Mcp.Tests
 		[Test]
 		public async Task StdioServer_InitializesDiscoversAndServesAnalysisRequests()
 		{
-			string serverPath = Path.Combine(AppContext.BaseDirectory, "ICSharpCode.ILSpy.Mcp.dll");
+			string serverPath = GetServerAssemblyPath();
 			string assemblyPath = typeof(AnalysisFixture).Assembly.Location;
 			string exportRoot = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString("N"));
 			string cancellationInputRoot = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString("N"));
@@ -128,6 +128,24 @@ namespace ICSharpCode.ILSpy.Mcp.Tests
 
 		static string GetStringProperty(System.Text.Json.JsonElement value, string name) => value.EnumerateObject()
 			.Single(property => property.Name.Equals(name, StringComparison.OrdinalIgnoreCase)).Value.GetString()!;
+
+		static string GetServerAssemblyPath()
+		{
+			var configurationDirectory = new DirectoryInfo(AppContext.BaseDirectory);
+			while (configurationDirectory != null && configurationDirectory.Name != "Debug" && configurationDirectory.Name != "Release")
+				configurationDirectory = configurationDirectory.Parent;
+			Assert.That(configurationDirectory, Is.Not.Null, "Could not determine the test build configuration.");
+
+			var repositoryDirectory = new DirectoryInfo(AppContext.BaseDirectory);
+			while (repositoryDirectory != null && !File.Exists(Path.Combine(repositoryDirectory.FullName, "ILSpy.sln")))
+				repositoryDirectory = repositoryDirectory.Parent;
+			Assert.That(repositoryDirectory, Is.Not.Null, "Could not find the repository root.");
+
+			string serverPath = Path.Combine(repositoryDirectory!.FullName, "ICSharpCode.ILSpy.Mcp", "bin",
+				configurationDirectory!.Name, "net10.0", "ICSharpCode.ILSpy.Mcp.dll");
+			Assert.That(File.Exists(serverPath), Is.True, $"MCP server build output was not found at '{serverPath}'.");
+			return serverPath;
+		}
 
 		static System.Text.Json.JsonElement[] GetArrayProperty(System.Text.Json.JsonElement value, string name) => value.EnumerateObject()
 			.Single(property => property.Name.Equals(name, StringComparison.OrdinalIgnoreCase)).Value.EnumerateArray().ToArray();
