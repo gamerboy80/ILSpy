@@ -23,6 +23,7 @@ using Avalonia;
 using Avalonia.Headless;
 using Avalonia.Headless.NUnit;
 using Avalonia.Input;
+using Avalonia.Media;
 using Avalonia.VisualTree;
 
 using AvaloniaEdit;
@@ -56,8 +57,7 @@ public class ReferenceClickTests
 		var tab = await vm.DockWorkspace.WaitForDecompiledTextAsync();
 
 		var view = window.GetVisualDescendants().OfType<DecompilerTextView>().First();
-		AvaloniaHeadlessPlatform.ForceRenderTimerTick();
-		Avalonia.Threading.Dispatcher.UIThread.RunJobs();
+		Waiters.PumpUI(window);
 		window.UpdateLayout();
 		view.Editor.TextArea.TextView.EnsureVisualLines();
 		return (window, view, tab);
@@ -174,5 +174,82 @@ public class ReferenceClickTests
 
 		view.Editor.TextArea.Selection.IsEmpty.Should().BeTrue(
 			"moving the mouse after a click, with no button held, must not select text");
+	}
+
+	/// <summary>
+	/// Scrolls the document until a navigable reference sits behind <paramref name="overlay"/>
+	/// (a visual that covers part of the text area) and returns a point inside the reference's
+	/// text where a click hit-tests to the overlay rather than the text.
+	/// </summary>
+	static (ReferenceSegment Segment, Point Point) FindReferenceBehind(
+		MainWindow window, DecompilerTextView view, DecompilerTabPageModel tab, Visual overlay)
+	{
+		var textView = view.Editor.TextArea.TextView;
+		foreach (var segment in tab.References!.Where(r => r.Reference != null && r.Kind == ReferenceMode.Link && !r.IsDefinition))
+		{
+			var line = view.Editor.Document.GetLineByOffset(segment.StartOffset);
+			// Put the line at the very top of the viewport, where the overlay lives.
+			view.Editor.ScrollTo(line.LineNumber, segment.StartOffset - line.Offset + 1, VisualYPosition.LineTop,
+				referencedVerticalViewPortOffset: 0, minimumScrollFraction: 0);
+			window.UpdateLayout();
+			textView.EnsureVisualLines();
+			for (int offset = 1; offset <= segment.Length; offset++)
+			{
+				var position = new TextViewPosition(line.LineNumber, segment.StartOffset - line.Offset + offset);
+				var visual = textView.GetVisualPosition(position, VisualYPosition.LineMiddle) - textView.ScrollOffset;
+				var point = textView.TranslatePoint(visual, window)!.Value;
+				// Only the overlay's child controls are hit-testable, not its whole rectangle, so the
+				// hit test is the criterion rather than the overlay's bounds.
+				if (window.GetVisualAt(point) is { } hit && (hit == overlay || overlay.IsVisualAncestorOf(hit)))
+					return (segment, point);
+			}
+		}
+		Assert.Fail("no navigable reference can be scrolled behind the overlay");
+		return default;
+	}
+
+	[AvaloniaTest]
+	public async Task Click_On_The_Search_Panel_Does_Not_Follow_The_Link_Behind_It()
+	{
+		var (window, view, tab) = await SetupAsync();
+
+		// Issue #4245: the Ctrl+F overlay is a visual child of the TextArea, so its clicks route
+		// through the same TextArea handlers that resolve reference clicks by pointer position.
+		var panel = view.SearchPanel;
+		panel.Open();
+		window.UpdateLayout();
+		Waiters.PumpUI(window);
+		var segment = tab.References!.First(r => r.Reference != null && r.Kind == ReferenceMode.Link && !r.IsDefinition);
+		var line = view.Editor.Document.GetLineByOffset(segment.StartOffset);
+		// Align the hit-testable search input with a known reference. The panel fills the text area,
+		// but its controls are right-aligned and platform font metrics can otherwise leave every
+		// available reference outside the controls.
+		view.Editor.ScrollTo(line.LineNumber, segment.StartOffset - line.Offset + 1, VisualYPosition.LineTop,
+			referencedVerticalViewPortOffset: 0, minimumScrollFraction: 0);
+		window.UpdateLayout();
+		view.Editor.TextArea.TextView.EnsureVisualLines();
+		var position = new TextViewPosition(line.LineNumber, segment.StartOffset - line.Offset + 1);
+		var visual = view.Editor.TextArea.TextView.GetVisualPosition(position, VisualYPosition.LineMiddle)
+			- view.Editor.TextArea.TextView.ScrollOffset;
+		var referencePoint = view.Editor.TextArea.TextView.TranslatePoint(visual, window)!.Value;
+		var searchInput = panel.GetVisualDescendants().OfType<Avalonia.Controls.TextBox>().First();
+		var searchInputPoint = searchInput.TranslatePoint(default, window)!.Value;
+		panel.RenderTransform = new TranslateTransform(
+			referencePoint.X - searchInputPoint.X - searchInput.Bounds.Width / 2,
+			referencePoint.Y - searchInputPoint.Y - searchInput.Bounds.Height / 2);
+		window.UpdateLayout();
+		// The hit tests below (and the click) are answered from the rendered frame, so the moved
+		// panel has to be drawn before they can see it at its new place.
+		Waiters.PumpUI(window);
+		var (_, point) = FindReferenceBehind(window, view, tab, panel);
+
+		var navigated = false;
+		tab.NavigateRequested += (_, _) => navigated = true;
+
+		window.MouseDown(point, MouseButton.Left);
+		window.MouseUp(point, MouseButton.Left);
+
+		navigated.Should().BeFalse("a click on the find panel must not follow the reference it covers");
+		panel.IsClosed.Should().BeFalse("the find panel stays open after being clicked");
 	}
 }
