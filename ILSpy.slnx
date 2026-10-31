@@ -24,6 +24,8 @@
   <Project Path="ICSharpCode.Decompiler/ICSharpCode.Decompiler.csproj" />
   <Project Path="ICSharpCode.ILSpyCmd.Tests/ICSharpCode.ILSpyCmd.Tests.csproj" />
   <Project Path="ICSharpCode.ILSpyCmd/ICSharpCode.ILSpyCmd.csproj" />
+  <Project Path="ICSharpCode.ILSpy.Mcp.Tests/ICSharpCode.ILSpy.Mcp.Tests.csproj" />
+  <Project Path="ICSharpCode.ILSpy.Mcp/ICSharpCode.ILSpy.Mcp.csproj" />
   <Project Path="ICSharpCode.ILSpyX/ICSharpCode.ILSpyX.csproj" />
   <Project Path="ILSpy.BamlDecompiler.Tests.Windows/ILSpy.BamlDecompiler.Tests.Windows.csproj" />
   <Project Path="ILSpy.BamlDecompiler.Tests/ILSpy.BamlDecompiler.Tests.csproj" />
