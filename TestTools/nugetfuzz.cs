@@ -32,7 +32,10 @@
 // already exists next to the assembly, which is how the lint is calibrated: it must report
 // nothing at all for a PDB the C# compiler wrote.
 //
-// usage: dotnet run nugetfuzz.cs -- [--download-only] [--corpus-out <file>] <PackageId[@Version]>... | @packagelist.txt
+// --jobs <N> processes up to N packages concurrently (type sweep and --download-only only; the
+// output of concurrent packages interleaves).
+//
+// usage: dotnet run nugetfuzz.cs -- [--download-only] [--jobs <N>] [--corpus-out <file>] <PackageId[@Version]>... | @packagelist.txt
 //        dotnet run nugetfuzz.cs -- [--pdb] <PackageId[@Version]>... | @packagelist.txt
 //        dotnet run nugetfuzz.cs -- --pdb-lint <file.dll|dir>... | @corpus.txt
 
@@ -94,6 +97,9 @@ if (dumpDir != null)
 	Directory.CreateDirectory(dumpDir);
 var versionCache = new Dictionary<string, List<NuGetVersion>>();
 var noSuchPackage = new HashSet<string>();
+// Guards failures, the counters, versionCache, noSuchPackage and corpusDirs when packages run concurrently.
+var stateLock = new object();
+var downloadGate = new SemaphoreSlim(1);
 
 // Legacy framework-satellite assemblies whose nuget package id differs from the assembly name.
 var assemblyPackageAlias = new Dictionary<string, string> {
@@ -153,9 +159,20 @@ var pdbMode = args.Contains("--pdb");
 // Checks the PDB the assembly already ships with. Calibration, not a sweep.
 var pdbLint = args.Contains("--pdb-lint");
 var packageArgs = new List<string>();
+int jobs = 1;
 for (int i = 0; i < args.Length; i++)
 {
-	if (args[i] == "--corpus-out")
+	if (args[i] is "--jobs" or "-j" || args[i].StartsWith("-j") && !args[i].StartsWith("--"))
+	{
+		// Accepts "--jobs 6", "-j 6" and "-j6".
+		var value = args[i] is "--jobs" or "-j" ? (++i < args.Length ? args[i] : "") : args[i][2..];
+		if (!int.TryParse(value, out jobs) || jobs < 1)
+		{
+			Console.Error.WriteLine("--jobs requires a positive number");
+			return 1;
+		}
+	}
+	else if (args[i] == "--corpus-out")
 	{
 		if (++i == args.Length || args[i].StartsWith("--"))
 		{
@@ -174,9 +191,16 @@ if (corpusOut != null && !downloadOnly)
 	Console.Error.WriteLine("--corpus-out requires --download-only");
 	return 1;
 }
+if (jobs > 1 && (pdbMode || pdbLint))
+{
+	Console.Error.WriteLine("--jobs cannot be combined with --pdb or --pdb-lint");
+	return 1;
+}
 // Findings first hit by the assembly being decompiled. They get their reference context
 // once it is done, because the resolver keeps discovering references until then.
-var pendingContext = new List<string>();
+// Async-local so each concurrently processed package has its own list.
+var pendingContextHolder = new AsyncLocal<List<string>>();
+List<string> PendingContext() => pendingContextHolder.Value ??= new List<string>();
 var arguments = packageArgs
 	.SelectMany(a => a.StartsWith('@') ? File.ReadAllLines(a[1..]) : new[] { a })
 	.Select(l => l.Trim())
@@ -184,7 +208,7 @@ var arguments = packageArgs
 	.ToList();
 if (arguments.Count == 0)
 {
-	Console.Error.WriteLine("usage: nugetfuzz [--download-only] [--corpus-out <file>] <PackageId[@Version]>... | @packagelist.txt");
+	Console.Error.WriteLine("usage: nugetfuzz [--download-only] [--jobs <N>] [--corpus-out <file>] <PackageId[@Version]>... | @packagelist.txt");
 	Console.Error.WriteLine("       nugetfuzz [--pdb] <PackageId[@Version]>... | @packagelist.txt");
 	Console.Error.WriteLine("       nugetfuzz --pdb-lint <file.dll|dir>... | @corpus.txt");
 	Console.Error.WriteLine("       nugetfuzz --report <ledger.jsonl> [out.html]");
@@ -199,7 +223,7 @@ if (pdbLint)
 }
 else
 {
-	foreach (var spec in arguments)
+	await Parallel.ForEachAsync(arguments, new ParallelOptions { MaxDegreeOfParallelism = jobs }, async (spec, _) =>
 	{
 		try
 		{
@@ -216,7 +240,7 @@ else
 		{
 			Report(spec, "-", "-", ex);
 		}
-	}
+	});
 }
 
 if (corpusOut != null)
@@ -301,7 +325,8 @@ async Task ProcessPackage(string spec)
 		// The package and its dependency closure are in the cache now, which is all a
 		// corpus needs; decompiling every type is what the sweep is for.
 		Console.WriteLine($"  cached: {libDir}");
-		corpusDirs.Add(libDir);
+		lock (stateLock)
+			corpusDirs.Add(libDir);
 		return;
 	}
 	// The installed runtime dir is a last-resort fallback only: Microsoft.NETCore.App
@@ -522,21 +547,26 @@ async Task<T> WithRetry<T>(Func<Task<T>> request)
 async Task<List<NuGetVersion>?> GetVersions(string id)
 {
 	var key = id.ToLowerInvariant();
-	if (noSuchPackage.Contains(key))
-		return null;
-	if (versionCache.TryGetValue(key, out var cached))
-		return cached;
+	lock (stateLock)
+	{
+		if (noSuchPackage.Contains(key))
+			return null;
+		if (versionCache.TryGetValue(key, out var cached))
+			return cached;
+	}
 	try
 	{
 		var index = await WithRetry(() => http.GetFromJsonAsync<VersionIndex>(
 			$"https://api.nuget.org/v3-flatcontainer/{key}/index.json"));
 		var versions = index!.versions.Select(NuGetVersion.Parse).ToList();
-		versionCache[key] = versions;
+		lock (stateLock)
+			versionCache[key] = versions;
 		return versions;
 	}
 	catch (HttpRequestException)
 	{
-		noSuchPackage.Add(key);
+		lock (stateLock)
+			noSuchPackage.Add(key);
 		return null;
 	}
 }
@@ -555,7 +585,7 @@ async Task<bool> TryFetchMissingRef(IAssemblyReference reference, Version? coreV
 	{
 		lock (dirs)
 		{
-			return dirs.Any(d => File.Exists(Path.Combine(d, reference.Name + ".dll")));
+			return AssemblyReferenceCompatibility.Find(dirs, reference) != null;
 		}
 	}
 	if (coreVersion != null
@@ -600,6 +630,52 @@ async Task<bool> TryFetchMissingRef(IAssemblyReference reference, Version? coreV
 		Console.WriteLine($"  ! undeclared dependency {reference.Name}: {ex.Message}");
 	}
 	return Satisfied();
+}
+
+async Task ExpandForwarderReferences(List<string> dirs, Version? coreVersion, NuGetFramework matchTarget)
+{
+	var scanned = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+	for (bool expanded = true; expanded;)
+	{
+		expanded = false;
+		string[] files;
+		lock (dirs)
+		{
+			files = dirs.Where(Directory.Exists)
+				.SelectMany(d => Directory.EnumerateFiles(d, "*.dll"))
+				.ToArray();
+		}
+		foreach (var file in files)
+		{
+			if (!scanned.Add(file))
+				continue;
+			PEFile module;
+			try
+			{
+				module = new PEFile(file);
+			}
+			catch (Exception ex) when (ex is BadImageFormatException or MetadataFileNotSupportedException)
+			{
+				continue;
+			}
+			using (module)
+			{
+				foreach (var handle in module.Metadata.ExportedTypes)
+				{
+					var exportedType = module.Metadata.GetExportedType(handle);
+					if (exportedType.Implementation.Kind != HandleKind.AssemblyReference)
+						continue;
+					var reference = new ICSharpCode.Decompiler.Metadata.AssemblyReference(
+						module, (AssemblyReferenceHandle)exportedType.Implementation);
+					if (AssemblyReferenceCompatibility.Find(dirs, reference) != null)
+						continue;
+					var before = dirs.Count;
+					await TryFetchMissingRef(reference, coreVersion, matchTarget, dirs);
+					expanded |= dirs.Count != before;
+				}
+			}
+		}
+	}
 }
 
 // Adds the ref/<tfm> directory of a framework ref pack (WindowsDesktop, AspNetCore)
@@ -657,16 +733,25 @@ async Task<string> GetPackage(string id, NuGetVersion version)
 	if (Directory.Exists(globalDir))
 		return globalDir;
 	var dir = Path.Combine(cacheRoot, idLower, v);
-	if (!Directory.Exists(dir))
+	// Serialized so two packages sharing a dependency do not extract into the same .tmp directory.
+	await downloadGate.WaitAsync();
+	try
 	{
-		Console.WriteLine($"  downloading {id} {v}");
-		var bytes = await WithRetry(() => http.GetByteArrayAsync(
-			$"https://api.nuget.org/v3-flatcontainer/{idLower}/{v}/{idLower}.{v}.nupkg"));
-		var tmp = dir + ".tmp";
-		if (Directory.Exists(tmp))
-			Directory.Delete(tmp, true);
-		ZipFile.ExtractToDirectory(new MemoryStream(bytes), tmp);
-		Directory.Move(tmp, dir);
+		if (!Directory.Exists(dir))
+		{
+			Console.WriteLine($"  downloading {id} {v}");
+			var bytes = await WithRetry(() => http.GetByteArrayAsync(
+				$"https://api.nuget.org/v3-flatcontainer/{idLower}/{v}/{idLower}.{v}.nupkg"));
+			var tmp = dir + ".tmp";
+			if (Directory.Exists(tmp))
+				Directory.Delete(tmp, true);
+			ZipFile.ExtractToDirectory(new MemoryStream(bytes), tmp);
+			Directory.Move(tmp, dir);
+		}
+	}
+	finally
+	{
+		downloadGate.Release();
 	}
 	return dir;
 }
@@ -676,7 +761,7 @@ async Task DecompileAssembly(string pkg, string dllPath, List<string> searchDirs
 	// An assembly that bails out before reporting its resolutions leaves findings behind that
 	// never received a context. Dropping them here keeps the next assembly from stamping its
 	// own references onto them, which would name the wrong reference set for the finding.
-	pendingContext.Clear();
+	pendingContextHolder.Value = new List<string>();
 	var name = Path.GetFileName(dllPath);
 	PEFile module;
 	try
@@ -721,6 +806,9 @@ async Task DecompileAssembly(string pkg, string dllPath, List<string> searchDirs
 		// Last-resort only, for the same reason the ref packs are ordered as they are.
 		if (fallbackDir != null)
 			orderedDirs.Add(fallbackDir);
+		if (matchTarget.Framework == FrameworkConstants.FrameworkIdentifiers.NetStandard)
+			await AddRefPack(NetCoreRefPack, installedTfm.Version, orderedDirs);
+		await ExpandForwarderReferences(orderedDirs, coreVersion, matchTarget);
 		foreach (var d in orderedDirs)
 			resolver.AddSearchDirectory(d);
 		var fetchGate = new object();
@@ -742,7 +830,8 @@ async Task DecompileAssembly(string pkg, string dllPath, List<string> searchDirs
 			return;
 		}
 		Console.WriteLine($"  {name}");
-		assemblyCount++;
+		lock (stateLock)
+			assemblyCount++;
 		if (pdbMode)
 		{
 			CheckGeneratedPdb(pkg, name, module, decompiler, dllPath, orderedDirs);
@@ -756,9 +845,14 @@ async Task DecompileAssembly(string pkg, string dllPath, List<string> searchDirs
 			try
 			{
 				var tree = decompiler.DecompileType(type.FullTypeName);
+				foreach (var error in decompiler.Errors)
+					Report(pkg, name, type.FullTypeName.ToString(), error);
 				var code = SyntaxTreeToString(tree);
-				typeCount++;
-				charCount += code.Length;
+				lock (stateLock)
+				{
+					typeCount++;
+					charCount += code.Length;
+				}
 				// Compiler-generated types (<Module>, <PrivateImplementationDetails>,
 				// VB$AnonymousType_*, ...) are still decompiled to shake out edge cases,
 				// but empty output is normal for them ('<' and '$' match the decompiler's
@@ -824,11 +918,14 @@ void ReportResolutions(LoggingResolver logResolver, string dllPath, List<string>
 		context.Append($"{Environment.NewLine}  -r {dir}");
 	foreach (var (refName, refPath) in resolutions.OrderBy(kv => kv.Key, StringComparer.Ordinal))
 		context.Append($"{Environment.NewLine}  {refName} -> {refPath ?? "NOT FOUND"}");
-	foreach (var key in pendingContext)
-		failures[key] = failures[key] with { Context = context.ToString() };
-	pendingContext.Clear();
-	refsTotal += resolutions.Count;
-	refsResolved += resolutions.Count - unresolved.Count;
+	lock (stateLock)
+	{
+		foreach (var key in PendingContext())
+			failures[key] = failures[key] with { Context = context.ToString() };
+		refsTotal += resolutions.Count;
+		refsResolved += resolutions.Count - unresolved.Count;
+	}
+	PendingContext().Clear();
 	Console.WriteLine($"    refs: {resolutions.Count - unresolved.Count}/{resolutions.Count} resolved");
 	if (verbose)
 	{
@@ -1434,16 +1531,27 @@ void Report(string pkg, string asm, string type, Exception ex)
 		: inner is PdbFinding ? "PDB" : "EXCEPTION";
 	var key = $"{kind}|{inner.GetType().Name}|{inner.Message}|{topFrame}";
 	var location = $"{pkg} / {asm} / {type}";
-	if (failures.TryGetValue(key, out var existing))
+	bool duplicate;
+	lock (stateLock)
 	{
-		failures[key] = existing with { Count = existing.Count + 1 };
+		duplicate = failures.TryGetValue(key, out var existing);
+		if (duplicate)
+		{
+			failures[key] = existing! with { Count = existing.Count + 1 };
+		}
+		else
+		{
+			failures[key] = new Finding(kind, inner.GetType().Name, FirstLine(inner.Message),
+				FirstLine(topFrame), location, ex.ToString(), 1);
+			PendingContext().Add(key);
+		}
+	}
+	if (duplicate)
+	{
 		Console.WriteLine($"  [{kind}] (dup) {type}: {FirstLine(inner.Message)}");
 	}
 	else
 	{
-		failures[key] = new Finding(kind, inner.GetType().Name, FirstLine(inner.Message),
-			FirstLine(topFrame), location, ex.ToString(), 1);
-		pendingContext.Add(key);
 		Console.WriteLine($"  [{kind}] {location}");
 		foreach (var line in ex.ToString().Split('\n').Take(30))
 			Console.WriteLine("      " + line.TrimEnd());
@@ -1812,6 +1920,55 @@ class CollectAsserts(List<string> messages) : TraceListener
 // The wrapped UniversalAssemblyResolver consults the installed runtime BEFORE its search
 // directories, which lets runtime stub facades shadow ref-pack assemblies - hence the
 // directory probing happens here, in our order.
+static class AssemblyReferenceCompatibility
+{
+	public static string? Find(IEnumerable<string> dirs, IAssemblyReference reference)
+	{
+		foreach (var dir in dirs)
+		{
+			var path = Path.Combine(dir, reference.Name + ".dll");
+			if (!File.Exists(path))
+				continue;
+			try
+			{
+				using var file = new PEFile(path);
+				if (Matches(file, reference))
+					return path;
+			}
+			catch (Exception)
+			{
+				// Keep probing lower-priority directories after a corrupt candidate.
+			}
+		}
+		return null;
+	}
+
+	public static bool Matches(MetadataFile file, IAssemblyReference reference)
+	{
+		if (!file.IsAssembly)
+			return false;
+		var actual = AssemblyNameReference.Parse(file.FullName);
+		if (!string.Equals(actual.Name, reference.Name, StringComparison.OrdinalIgnoreCase))
+			return false;
+		if (reference.Version is { } requestedVersion
+			&& !IsZeroOrAllOnes(requestedVersion)
+			&& actual.Version != requestedVersion
+			&& !reference.IsRetargetable)
+		{
+			return false;
+		}
+		var requestedToken = reference.PublicKeyToken;
+		return requestedToken == null || requestedToken.Length == 0
+			|| requestedToken.SequenceEqual(actual.PublicKeyToken ?? Array.Empty<byte>());
+	}
+
+	static bool IsZeroOrAllOnes(Version version)
+		=> version.Major is 0 or -1
+			&& version.Minor is 0 or -1
+			&& version.Build is 0 or -1
+			&& version.Revision is 0 or -1;
+}
+
 class LoggingResolver(IAssemblyResolver inner, List<string> dirs, Func<IAssemblyReference, bool> onMiss) : IAssemblyResolver
 {
 	public readonly Dictionary<string, string?> Resolutions = new();
@@ -1821,12 +1978,18 @@ class LoggingResolver(IAssemblyResolver inner, List<string> dirs, Func<IAssembly
 
 	public MetadataFile? Resolve(IAssemblyReference reference)
 	{
-		var file = ResolveFromDirs(reference) ?? inner.Resolve(reference);
+		var file = ResolveFromDirs(reference);
+		if (file == null)
+		{
+			file = inner.Resolve(reference);
+			if (file != null && !AssemblyReferenceCompatibility.Matches(file, reference))
+				file = null;
+		}
 		if (file == null && onMiss(reference))
 		{
 			lock (loaded)
 			{
-				loaded.Remove(reference.Name);
+				loaded.Remove(reference.FullName);
 			}
 			file = ResolveFromDirs(reference);
 		}
@@ -1848,7 +2011,7 @@ class LoggingResolver(IAssemblyResolver inner, List<string> dirs, Func<IAssembly
 		}
 		lock (loaded)
 		{
-			if (loaded.TryGetValue(reference.Name, out var cached))
+			if (loaded.TryGetValue(reference.FullName, out var cached))
 				return cached;
 			MetadataFile? result = null;
 			foreach (var dir in snapshot)
@@ -1858,15 +2021,20 @@ class LoggingResolver(IAssemblyResolver inner, List<string> dirs, Func<IAssembly
 					continue;
 				try
 				{
-					result = new PEFile(path);
-					break;
+					var candidate = new PEFile(path);
+					if (AssemblyReferenceCompatibility.Matches(candidate, reference))
+					{
+						result = candidate;
+						break;
+					}
+					candidate.Dispose();
 				}
 				catch (Exception)
 				{
 					// unreadable candidate; keep probing lower-priority dirs
 				}
 			}
-			loaded[reference.Name] = result;
+			loaded[reference.FullName] = result;
 			return result;
 		}
 	}

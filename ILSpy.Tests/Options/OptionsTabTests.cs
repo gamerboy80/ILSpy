@@ -20,6 +20,7 @@ using System.Linq;
 using System.Threading.Tasks;
 
 using Avalonia.Controls;
+using Avalonia.Controls.Documents;
 using Avalonia.Controls.Presenters;
 using Avalonia.Headless.NUnit;
 using Avalonia.Media;
@@ -36,7 +37,6 @@ using ICSharpCode.ILSpy.Commands;
 using ICSharpCode.ILSpy.Docking;
 using ICSharpCode.ILSpy.Options;
 using ICSharpCode.ILSpy.TextView;
-using ICSharpCode.ILSpy.TreeNodes;
 using ICSharpCode.ILSpy.ViewModels;
 using ICSharpCode.ILSpy.Views;
 
@@ -96,7 +96,8 @@ public class OptionsTabTests
 		// document is still Options — so the user sees no visible change. The fix:
 		// ShowSelectedNode pulls focus back to MainTab whenever a tree-selection writes
 		// new content there.
-		var (_, vm) = await TestHarness.BootAsync(3);
+		var (_, vm) = await TestHarness.BootAsync();
+		var typeNode = await vm.OpenSampleAsync(typeof(DecompileSample));
 
 		// Open Options and confirm it's the active document.
 		AppComposition.Current.GetExport<MainMenuCommandRegistry>()
@@ -110,8 +111,6 @@ public class OptionsTabTests
 			"baseline: opening Options must make it the active document");
 
 		// Click a tree node — fires the same path as a real user mouse-click.
-		var typeNode = vm.AssemblyTreeModel.FindNode<TypeTreeNode>(
-			"System.Linq", "System.Linq", "System.Linq.Enumerable");
 		vm.AssemblyTreeModel.SelectNode(typeNode);
 		TestCapture.Step("tree-node-selected");
 
@@ -285,12 +284,10 @@ public class OptionsTabTests
 		TestCapture.Step("booted");
 
 		// Materialise a DecompilerTextView by selecting a node.
-		var typeNode = vm.AssemblyTreeModel.FindNode<TypeTreeNode>(
-			"System.Linq", "System.Linq", "System.Linq.Enumerable");
-		vm.AssemblyTreeModel.SelectNode(typeNode);
+		await vm.ShowSampleAsync(typeof(DecompileSample));
 		var view = await window.WaitForComponent<DecompilerTextView>();
 		var editor = await view.WaitForComponent<AvaloniaEdit.TextEditor>();
-		TestCapture.Step("enumerable-decompiled");
+		TestCapture.Step("sample-decompiled");
 
 		var originalSize = settings.DisplaySettings.SelectedFontSize;
 		var newSize = originalSize + 5;
@@ -313,16 +310,8 @@ public class OptionsTabTests
 		// pull focus back to MainTab and yank the user off the Options page they are editing.
 		var (_, vm) = await TestHarness.BootAsync(3);
 
-		// Show some decompiled content first, so there is a decompiler tab to refresh. Use a single
-		// small method, not the whole Enumerable type: the full type takes >15 s in headless and
-		// times out WaitForDecompiledTextAsync under CI load.
-		var typeNode = vm.AssemblyTreeModel.FindNode<TypeTreeNode>(
-			"System.Linq", "System.Linq", "System.Linq.Enumerable");
-		typeNode.IsExpanded = true;
-		var method = typeNode.Children.OfType<MethodTreeNode>()
-			.First(m => m.MethodDefinition.Name == "Empty");
-		vm.AssemblyTreeModel.SelectNode(method);
-		await vm.DockWorkspace.WaitForDecompiledTextAsync();
+		// Show some decompiled content first, so there is a decompiler tab to refresh.
+		await vm.ShowSampleAsync(typeof(DecompileSample));
 
 		// Open Options and confirm it is the active document.
 		AppComposition.Current.GetExport<MainMenuCommandRegistry>()
@@ -420,8 +409,8 @@ public class OptionsTabTests
 		// still reach them.
 		var usingLabel = window.GetVisualDescendants().OfType<TextBlock>()
 			.Single(t => t.Text == shown.First(s => s.Property.Name == nameof(ICSharpCode.Decompiler.DecompilerSettings.UsingDeclarations)).Description);
-		usingLabel.Classes.Should().Contain("search-hit", "narrowed Decompiler items must be highlighted too");
-		usingLabel.FontWeight.Should().Be(FontWeight.Bold, "the search-hit style must actually render");
+		var usingHighlight = usingLabel.Inlines!.OfType<Run>().Single(run => run.Classes.Contains("search-hit"));
+		usingHighlight.FontWeight.Should().Be(FontWeight.Bold, "the search-hit style must actually render");
 
 		// Reset while narrowed rebuilds the list but keeps the narrowing.
 		model.SelectedPage = decompilerPage;
@@ -462,8 +451,8 @@ public class OptionsTabTests
 
 		var labels = window.GetVisualDescendants().OfType<TextBlock>().ToList();
 		var showLineNumbers = labels.Single(t => t.Text == Resources.ShowLineNumbers);
-		showLineNumbers.Classes.Should().Contain("search-hit");
-		showLineNumbers.FontWeight.Should().Be(FontWeight.Bold, "the search-hit style must actually render");
+		var lineNumberHighlight = showLineNumbers.Inlines!.OfType<Run>().Single(run => run.Classes.Contains("search-hit"));
+		lineNumberHighlight.FontWeight.Should().Be(FontWeight.Bold, "the search-hit style must actually render");
 		labels.Single(t => t.Text == Resources.EnableWordWrap).Classes.Should().NotContain("search-hit");
 
 		model.SearchText = string.Empty;
@@ -471,8 +460,29 @@ public class OptionsTabTests
 		// Same TextBlock instance: clearing must not rebuild the panel, only drop the class.
 		TopLevel.GetTopLevel(showLineNumbers).Should().BeSameAs(window,
 			"clearing the search must leave the shown panel in place");
+		showLineNumbers.Inlines.Should().BeNull("clearing the search must remove the inline highlight");
 		showLineNumbers.Classes.Should().NotContain("search-hit",
 			"clearing the search must remove the highlight");
+	}
+
+	[AvaloniaTest]
+	public async Task Search_Highlights_Only_The_Matching_Substring()
+	{
+		var (model, window) = await OpenOptionsAsync();
+		model.SelectedPage = model.Pages.Single(page => page.Title == Resources.Decompiler);
+		await Waiters.WaitForIdleAsync();
+
+		model.SearchText = "loa";
+		await Waiters.WaitForIdleAsync();
+
+		var label = window.GetVisualDescendants().OfType<TextBlock>()
+			.Single(textBlock => textBlock.Text == Resources.DecompilerSettings_AutoLoadAssemblyReferences);
+		label.Inlines.Should().NotBeNull();
+		label.Inlines!.OfType<Run>().Select(run => run.Text).Should()
+			.Equal("Automatically ", "loa", "d assembly references");
+		label.Inlines.OfType<Run>().Single(run => run.Text == "loa").Classes.Should().Contain("search-hit");
+		label.Inlines.OfType<Run>().Single(run => run.Text == "loa").FontWeight.Should().Be(FontWeight.Bold);
+		label.Classes.Should().NotContain("search-hit", "the complete label must not be highlighted");
 	}
 
 	[AvaloniaTest]
